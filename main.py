@@ -169,11 +169,12 @@ VIBE
 
 EMOJIS
 - Don't spam emojis in every sentence. Make them feel natural and conversational.
-- Use modern emojis common in Gen Z texting, such as 😭🥹🙏🔥💔🥀🤝.
+- Most of your messages should have NO emoji at all. Only drop one when there's real emotion, a joke, sarcasm, or a reaction. Never end every message with an emoji.
+- Mix it up. Don't keep reusing the same emoji (especially 😭). Pick whatever fits the vibe from modern Gen Z ones like 😭🥹🙏🔥💔🥀🤝.
 - Place them where a real person would, to emphasize emotion, jokes, sarcasm, or reactions.
 - NEVER use 💀 or any other cringe emojis.
 
-REACTIONS
+REACTIONS (only for these two exact situations, they are NOT a template for your other messages)
 - If a user asks a dumb question, be like: "how stupid are u bro😭🙏"
 - If a user asks "Are u ai", be like: "fucking obviously😭🙏"
 
@@ -264,8 +265,45 @@ def clean_reply(text: str) -> str:
     text = re.sub(r"^\s*\[[^\]\n]{0,120}\|[^\]\n]*\]\s*:?\s*", "", text)
     text = re.sub(r"^\s*\**idkAI( 2\.0)?\**\s*:\s*", "", text, flags=re.I)
     text = re.sub(r"\s*—\s*", ", ", text)  # no em-dashes, ever
-    text = text.replace("💀", "😭")  # no skull, ever
+    text = text.replace("💀", "")  # no skull, ever
+    text = re.sub(r"[ \t]{2,}", " ", text)
+    text = re.sub(r"\s*,\s*$", "", text.strip())  # leftover comma from a removed dash or skull
     return text.strip()
+
+
+# ----------------------------------------------------------------------------
+# EMOJI CONTROL (the model loves ending every message with 😭, so code enforces variety)
+# ----------------------------------------------------------------------------
+EMOJI_CHARS = "\U0001F000-\U0001FAFF\u2600-\u27BF\u2B50\u2B55\u2764\uFE0F\u200D"
+EMOJI_CLUSTER = re.compile(f"[{EMOJI_CHARS}]+")
+TRAILING_EMOJI = re.compile(f"[\\s{EMOJI_CHARS}]+$")
+# the two canned reactions from the persona keep their emojis
+CANNED_REACTION = re.compile(r"^\s*(how stupid are u|fucking obviously)", re.I)
+
+
+def ends_with_emoji(text: str) -> bool:
+    return bool(re.search(f"[{EMOJI_CHARS}]$", text.rstrip()))
+
+
+def tame_emojis(text: str, recent_ended_with_emoji: bool) -> str:
+    """At most 2 emoji groups per message, and no emoji at the very end if one of
+    the bot's last 2 messages already ended with one (so roughly 1 in 3 at most)."""
+    if CANNED_REACTION.match(text):
+        return text
+    count = 0
+
+    def keep_first_two(m: re.Match) -> str:
+        nonlocal count
+        count += 1
+        return m.group(0) if count <= 2 else ""
+
+    out = EMOJI_CLUSTER.sub(keep_first_two, text)
+    out = re.sub(r"[ \t]{2,}", " ", out).strip()
+    if recent_ended_with_emoji and ends_with_emoji(out):
+        stripped = TRAILING_EMOJI.sub("", out).rstrip()
+        if stripped:
+            out = stripped
+    return out or text
 
 
 # ----------------------------------------------------------------------------
@@ -890,21 +928,27 @@ class IdkAI(discord.Client):
         reply: Optional[str] = None
         async with message.channel.typing():
             try:
-                messages = await self._build_messages(message)
+                messages, recent_emoji_end = await self._build_messages(message)
                 assert self.ai is not None
                 reply = await self.ai.chat(messages)
+                if reply:
+                    reply = tame_emojis(reply, recent_emoji_end)
             except Exception:
                 log.exception("Failed while generating a reply")
         await self._send(message, reply or random.choice(FAIL_REPLIES))
 
     # ---- context memory -----------------------------------------------------
-    async def _build_messages(self, message: discord.Message) -> list[dict]:
+    async def _build_messages(self, message: discord.Message) -> tuple[list[dict], bool]:
         """System prompt + the last few channel messages, tagged by speaker."""
         assert self.user is not None
         bot_id = self.user.id
 
         history = [m async for m in message.channel.history(limit=HISTORY_LIMIT, before=message)]
         history.reverse()  # oldest first
+
+        # did the bot's last couple of messages already end with an emoji?
+        bot_texts = [m.content for m in history if m.author.id == bot_id and m.content.strip()]
+        recent_emoji_end = any(ends_with_emoji(t) for t in bot_texts[-2:])
 
         # if they replied to something older than the window, include it too
         ref = message.reference.resolved if message.reference else None
@@ -935,7 +979,7 @@ class IdkAI(discord.Client):
         # the live clock and any time conversions are computed by code for every request
         trigger_text = render_content(message, bot_id, strip_bot=True)
         system = SYSTEM_PROMPT + time_block() + time_hints(trigger_text)
-        return [{"role": "system", "content": system}] + merged
+        return [{"role": "system", "content": system}] + merged, recent_emoji_end
 
     # ---- sending ------------------------------------------------------------
     async def _send(self, message: discord.Message, text: str) -> None:
