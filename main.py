@@ -40,11 +40,17 @@ import random
 import re
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import aiohttp
 import discord
 from aiohttp import web
+
+try:  # needs the tzdata package on some hosts (it's in requirements.txt)
+    from zoneinfo import ZoneInfo
+except ImportError:  # pragma: no cover
+    ZoneInfo = None  # type: ignore[assignment,misc]
 
 try:  # optional, only matters when running locally with a .env file
     from dotenv import load_dotenv
@@ -86,6 +92,8 @@ HISTORY_LIMIT = int(os.getenv("HISTORY_LIMIT", "15"))
 MAX_TOKENS = int(os.getenv("MAX_TOKENS", "300"))
 USER_COOLDOWN = float(os.getenv("USER_COOLDOWN_SECONDS", "4"))
 PORT = int(os.getenv("PORT", "8080"))
+# lower = more accurate and less random (0.9 made it flaky on facts and math)
+TEMPERATURE = float(os.getenv("TEMPERATURE", "0.6"))
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1"
 GROQ_URL = "https://api.groq.com/openai/v1"
@@ -95,23 +103,26 @@ GROQ_URL = "https://api.groq.com/openai/v1"
 # and orders them by this preference list (smartest first). If the download
 # fails it falls back to FALLBACK_MODELS.
 PREFERRED_MODELS = [
+    "openai/gpt-oss-120b",
+    "qwen/qwen3-235b",
+    "qwen/qwen3-next-80b",
     "meta-llama/llama-3.3-70b-instruct",
     "meta-llama/llama-4-maverick",
-    "google/gemini-2.0-flash",
-    "google/gemini-2.5-flash",
-    "qwen/qwen3-235b",
+    "z-ai/glm-4.5-air",
+    "moonshotai/kimi-k2",
     "deepseek/deepseek-chat-v3",
-    "openai/gpt-oss-120b",
     "google/gemma-3-27b",
     "mistralai/mistral-small-3",
 ]
 FALLBACK_MODELS = [
+    "openai/gpt-oss-120b:free",
+    "qwen/qwen3-235b-a22b:free",
     "meta-llama/llama-3.3-70b-instruct:free",
     "meta-llama/llama-4-maverick:free",
-    "google/gemini-2.0-flash-exp:free",
-    "qwen/qwen3-235b-a22b:free",
-    "openai/gpt-oss-120b:free",
 ]
+# Any other free model that isn't in the list above is added after these, biggest
+# first (by the "NNb" in its name), so brand new free models still get picked up.
+NOT_CHAT_HINTS = ("guard", "embed", "whisper", "tts", "audio", "image", "vision", "-vl", "ocr", "moderation")
 
 # Groq: llama-3.3-70b-versatile was retired for free/developer accounts on
 # 2026-08-16 (and llama3-70b-8192 in 2025). Groq points people at gpt-oss-120b and
@@ -133,7 +144,7 @@ GROQ_FALLBACK_MODELS = [
 
 # reasoning models burn tokens "thinking", so they get extra room for the answer
 REASONING_HINTS = ("gpt-oss", "qwen3", "deepseek-r1", "-r1")
-REASONING_HEADROOM = 500
+REASONING_HEADROOM = 800
 
 # error text that means "this model is gone / not available" rather than a bad request
 DEAD_MODEL_HINTS = ("decommission", "model_not_found", "does not exist", "no endpoints found")
@@ -166,7 +177,13 @@ SERVER CONTEXT (added automatically, always follow this):
 - Each person is separate. Do not mix up who said what. Use people's names when it fits, never their raw ID.
 - Reply with ONLY your message text. Never write the [Name | ID | status] header and never start with your own name.
 - You can only read text, not images or files.
-- Keep it short, usually 1 to 3 sentences."""
+
+ACCURACY FIRST (this matters more than sounding cool):
+- Talking casual never means being wrong. For facts, math, dates, times, time zones, conversions, code, and explanations, work it out carefully step by step in your head, get it RIGHT, and only then say it in your own voice.
+- If you're not sure about something, say so casually instead of guessing or making stuff up. Never invent facts, links, or quotes.
+- A CURRENT TIME block (and sometimes a TIME CONVERSION block) is added below. Those numbers are computed by code and are always correct. Use them exactly and never contradict them.
+- Eastern time is EDT (UTC-4) in summer and EST (UTC-5) in winter. Most people say "EST" when they just mean Eastern time.
+- Keep replies short, usually 1 to 3 sentences, but give a fuller answer (still casual) when the question needs it."""
 
 SYSTEM_PROMPT = PERSONA_PROMPT + TECH_NOTES
 
@@ -223,12 +240,159 @@ def render_content(m: discord.Message, bot_id: int, strip_bot: bool) -> str:
 def clean_reply(text: str) -> str:
     """Enforce the persona rules in code in case the model slips."""
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.S | re.I)
+    text = re.sub(r"<think>.*$", "", text, flags=re.S | re.I)  # unfinished thinking, drop it
     # strip "[Name | id | status]:" or "idkAI 2.0:" prefixes the model might copy
     text = re.sub(r"^\s*\[[^\]\n]{0,120}\|[^\]\n]*\]\s*:?\s*", "", text)
     text = re.sub(r"^\s*\**idkAI( 2\.0)?\**\s*:\s*", "", text, flags=re.I)
     text = re.sub(r"\s*—\s*", ", ", text)  # no em-dashes, ever
     text = text.replace("💀", "😭")  # no skull, ever
     return text.strip()
+
+
+# ----------------------------------------------------------------------------
+# CLOCK + TIME ZONE HELPERS (so time questions are answered by code, not guessed)
+# ----------------------------------------------------------------------------
+TABLE_ZONES = [
+    ("UTC", "UTC"),
+    ("Eastern", "America/New_York"),
+    ("Central", "America/Chicago"),
+    ("Mountain", "America/Denver"),
+    ("Pacific", "America/Los_Angeles"),
+    ("UK", "Europe/London"),
+    ("India", "Asia/Kolkata"),
+    ("Japan", "Asia/Tokyo"),
+]
+TZ_FIXED = {  # literal abbreviations (fixed UTC offsets in hours)
+    "est": -5, "edt": -4, "cst": -6, "cdt": -5, "mst": -7, "mdt": -6,
+    "pst": -8, "pdt": -7, "utc": 0, "gmt": 0, "bst": 1, "cet": 1, "cest": 2,
+    "jst": 9, "aest": 10, "aedt": 11,
+}
+TZ_LOOSE = {  # people often say EST/CST/PST when they mean that region's local time
+    "est": "America/New_York", "edt": "America/New_York",
+    "cst": "America/Chicago", "cdt": "America/Chicago",
+    "mst": "America/Denver", "mdt": "America/Denver",
+    "pst": "America/Los_Angeles", "pdt": "America/Los_Angeles",
+}
+TZ_REGION = {  # "ET/CT/MT/PT" always mean local time of that region (DST aware)
+    "et": "America/New_York", "ct": "America/Chicago",
+    "mt": "America/Denver", "pt": "America/Los_Angeles",
+}
+REGION_LABEL = {
+    "America/New_York": "Eastern", "America/Chicago": "Central",
+    "America/Denver": "Mountain", "America/Los_Angeles": "Pacific",
+}
+TIME_RE = re.compile(
+    r"\b(\d{1,2})(?::(\d{2}))?\s*([ap]\.?m\.?)?\s*"
+    r"(est|edt|et|cst|cdt|ct|mst|mdt|mt|pst|pdt|pt|utc|gmt|bst|cet|cest|jst|aest|aedt)\b",
+    re.I,
+)
+
+
+def _zone(name: str):
+    if ZoneInfo is None:
+        return None
+    try:
+        return ZoneInfo(name)
+    except Exception:
+        return None
+
+
+def _fmt_clock(dt: datetime) -> str:
+    return f"{dt.hour % 12 or 12}:{dt.minute:02d} {'AM' if dt.hour < 12 else 'PM'}"
+
+
+def _fmt_offset(dt: datetime) -> str:
+    off = dt.utcoffset() or timedelta(0)
+    minutes = int(off.total_seconds() // 60)
+    h, m = divmod(abs(minutes), 60)
+    return f"UTC{'+' if minutes >= 0 else '-'}{h}" + (f":{m:02d}" if m else "")
+
+
+def time_block(now: Optional[datetime] = None) -> str:
+    """Live clock for the system prompt so the bot always knows the date and time."""
+    now = now or datetime.now(timezone.utc)
+    lines = []
+    for label, zname in TABLE_ZONES:
+        z = _zone(zname)
+        if z is None:
+            continue
+        t = now.astimezone(z)
+        lines.append(
+            f"- {label}: {t.strftime('%a %b')} {t.day}, {_fmt_clock(t)} {t.tzname()} ({_fmt_offset(t)})"
+        )
+    if not lines:
+        return ""
+    return "\n\nCURRENT TIME (computed by code, always correct):\n" + "\n".join(lines)
+
+
+def time_hints(text: str, now: Optional[datetime] = None) -> str:
+    """If the message mentions a clock time with a zone ("10:38 pm est"), convert it in code."""
+    now = now or datetime.now(timezone.utc)
+    out: list[str] = []
+    seen: set[tuple] = set()
+    for m in TIME_RE.finditer(text):
+        hour_s, min_s, ampm, tzname = m.group(1), m.group(2), m.group(3), m.group(4).lower()
+        if min_s is None and not ampm:
+            continue  # a bare "5 pt" or "10 mt" is probably not a clock time
+        hour, minute = int(hour_s), int(min_s or 0)
+        if minute > 59:
+            continue
+        if ampm:
+            if not 1 <= hour <= 12:
+                continue
+            hour = hour % 12 + (12 if ampm.lower().startswith("p") else 0)
+        elif hour > 23:
+            continue
+        key = (hour, minute, tzname)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        original = m.group(0).strip()
+        readings = []  # (description, source-local datetime)
+        if tzname in TZ_FIXED:
+            fz = timezone(timedelta(hours=TZ_FIXED[tzname]))
+            d = now.astimezone(fz).date()
+            lit = datetime(d.year, d.month, d.day, hour, minute, tzinfo=fz)
+            region = _zone(TZ_LOOSE[tzname]) if tzname in TZ_LOOSE else None
+            loc = None
+            if region is not None:
+                d2 = now.astimezone(region).date()
+                loc = datetime(d2.year, d2.month, d2.day, hour, minute, tzinfo=region)
+            if loc is not None and loc.utcoffset() != lit.utcoffset():
+                label = REGION_LABEL[TZ_LOOSE[tzname]]
+                readings.append((f"as {label} local time, which right now is {loc.tzname()} ({_fmt_offset(loc)})", loc))
+                readings.append((f"as literal {tzname.upper()} ({_fmt_offset(lit)})", lit))
+            else:
+                readings.append((f"as {tzname.upper()} ({_fmt_offset(lit)})", lit))
+        elif tzname in TZ_REGION:
+            region = _zone(TZ_REGION[tzname])
+            if region is None:
+                continue
+            d = now.astimezone(region).date()
+            loc = datetime(d.year, d.month, d.day, hour, minute, tzinfo=region)
+            readings.append((f"as {tzname.upper()} local time, right now {loc.tzname()} ({_fmt_offset(loc)})", loc))
+
+        for desc, src_dt in readings:
+            parts = []
+            for label, zname in TABLE_ZONES:
+                z = _zone(zname)
+                if z is None:
+                    continue
+                t = src_dt.astimezone(z)
+                shift = (t.date() - src_dt.date()).days
+                tag = "" if shift == 0 else (f" (+{shift} day)" if shift > 0 else f" ({shift} day)")
+                parts.append(f"{label} {_fmt_clock(t)} {t.tzname()}{tag}")
+            if parts:
+                out.append(f'- "{original}" {desc}: ' + " | ".join(parts))
+    if not out:
+        return ""
+    return (
+        "\n\nTIME CONVERSION FOR THIS MESSAGE (computed by code, use these exact numbers, do not redo the math):\n"
+        + "\n".join(out[:6])
+        + "\nPeople who say EST/CST/PST usually just mean that region's local time, so lead with that "
+        "reading and mention the literal one in a few words if the two differ."
+    )
 
 
 # ----------------------------------------------------------------------------
@@ -244,12 +408,14 @@ class ModelPicker:
         free_only: bool,
         needs_auth: bool,
         label: str,
+        rank_extra: bool = False,
     ) -> None:
         self.models_url = models_url
         self.preferred = preferred
         self.free_only = free_only  # OpenRouter: keep only $0 models
         self.needs_auth = needs_auth  # Groq: model list needs an API key
         self.label = label
+        self.rank_extra = rank_extra  # also add unlisted models, biggest first
         self.override = bool(override)
         self.models: list[str] = list(override) or list(fallback)
         self.last_refresh = 0.0
@@ -294,6 +460,18 @@ class ModelPicker:
                 for mid in sorted(usable):
                     if mid.startswith(prefix) and mid not in ranked:
                         ranked.append(mid)
+            if self.rank_extra:
+                def size(mid: str) -> float:
+                    nums = re.findall(r"(\d+(?:\.\d+)?)b", mid.lower())
+                    return max((float(n) for n in nums), default=0.0)
+
+                extra = [
+                    mid for mid in usable
+                    if mid not in ranked
+                    and not any(h in mid.lower() for h in NOT_CHAT_HINTS)
+                    and size(mid) >= 30
+                ]
+                ranked += sorted(extra, key=size, reverse=True)
             if ranked:
                 self.models = ranked[:6]
                 log.info("%s model chain: %s", self.label, ", ".join(self.models))
@@ -418,7 +596,7 @@ class ChatProvider:
         payload = {
             "model": model,
             "messages": messages,
-            "temperature": 0.9,
+            "temperature": TEMPERATURE,
             **self.token_params(model),
             **extras,
         }
@@ -520,6 +698,7 @@ class OpenRouterProvider(ChatProvider):
                 free_only=True,
                 needs_auth=False,
                 label="OpenRouter",
+                rank_extra=True,
             ),
         )
 
@@ -527,6 +706,12 @@ class OpenRouterProvider(ChatProvider):
         h = super().headers(key)
         h.update({"HTTP-Referer": "https://discord.com", "X-Title": "idkAI 2.0"})
         return h
+
+    def extras_for(self, model: str) -> dict:
+        # let reasoning models actually think (medium effort) but never show the thinking
+        if model in self.models.no_extras or not any(x in model for x in REASONING_HINTS):
+            return {}
+        return {"reasoning": {"effort": "medium", "exclude": True}}
 
     def token_params(self, model: str) -> dict:
         extra = REASONING_HEADROOM if any(x in model for x in REASONING_HINTS) else 0
@@ -571,7 +756,7 @@ class GroqProvider(ChatProvider):
         if model in self.models.no_extras:
             return {}
         if model.startswith("openai/gpt-oss"):
-            return {"reasoning_effort": "low", "include_reasoning": False}
+            return {"reasoning_effort": "medium", "include_reasoning": False}
         if model.startswith("qwen/"):
             return {"reasoning_effort": "none"}
         return {}
@@ -728,7 +913,10 @@ class IdkAI(discord.Client):
         while merged and merged[0]["role"] != "user":
             merged.pop(0)  # conversation must start with a user turn
 
-        return [{"role": "system", "content": SYSTEM_PROMPT}] + merged
+        # the live clock and any time conversions are computed by code for every request
+        trigger_text = render_content(message, bot_id, strip_bot=True)
+        system = SYSTEM_PROMPT + time_block() + time_hints(trigger_text)
+        return [{"role": "system", "content": system}] + merged
 
     # ---- sending ------------------------------------------------------------
     async def _send(self, message: discord.Message, text: str) -> None:
