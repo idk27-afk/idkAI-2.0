@@ -116,9 +116,13 @@ OPENROUTER_URL = "https://openrouter.ai/api/v1"
 GROQ_URL = "https://api.groq.com/openai/v1"
 
 # ---- version + update log (the bot knows these; edit them here when you ship an update) ----
-BOT_VERSION = "2.0.4"
+BOT_VERSION = "2.0.5"
 CHANGELOG: list[tuple[str, list[str]]] = [  # newest first
-    ("2.0.4", [
+      ("2.0.5", [
+        "doesn't reply to messages that weren't replying to him",
+        "doesn't leak what he sees in order to determine who is who",
+     ]),
+     ("2.0.4", [
         "way more natural and less corny: lowercase, no more dated words like fam",
         "search mode: when the owner turns it on, he looks real questions up on the web",
         "stays in character after weird or bypass messages instead of switching to robot mode",
