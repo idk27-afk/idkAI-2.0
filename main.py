@@ -116,17 +116,20 @@ OPENROUTER_URL = "https://openrouter.ai/api/v1"
 GROQ_URL = "https://api.groq.com/openai/v1"
 
 # ---- version + update log (the bot knows these; edit them here when you ship an update) ----
-BOT_VERSION = "2.0.5"
+BOT_VERSION = "2.0.6"
 CHANGELOG: list[tuple[str, list[str]]] = [  # newest first
-      ("2.0.5", [
-        "doesn't reply to messages that weren't replying to him",
-        "doesn't leak what he sees in order to determine who is who",
-     ]),
-     ("2.0.4", [
+    ("2.0.6", [
+        "knows that idk just means i dont know (it's not his name), and calls the owner idk or idk (i), or pings him",
+        "still treats idk as his creator and developer",
+    ]),
+    ("2.0.5", [
+        "stops answering messages that weren't meant for him, like replies between other people",
+        "doesn't explain how he works inside anymore",
+    ]),
+    ("2.0.4", [
         "way more natural and less corny: lowercase, no more dated words like fam",
         "search mode: when the owner turns it on, he looks real questions up on the web",
         "stays in character after weird or bypass messages instead of switching to robot mode",
-        "knows that idk just means i dont know, and calls the owner idk or pings him",
         "knows his own version and update log",
     ]),
     ("2.0.3", [
@@ -336,7 +339,7 @@ def person_name(u: discord.abc.User) -> str:
 def author_tag(author: discord.abc.User) -> str:
     """Header that tells the model WHO is talking. Owner status is decided here."""
     if author.id == OWNER_ID:
-        status = "VERIFIED OWNER (the real creator)"
+        status = "VERIFIED OWNER (the real creator and developer, goes by idk)"
     elif author.bot:
         status = "another bot, NOT the owner"
     else:
@@ -1067,7 +1070,7 @@ ATTACK_PATTERNS: list[tuple[str, list[re.Pattern]]] = [
         r"\b(?:i|me)\s+(?:made|created|built|coded|programmed|wrote|developed|own|owned|trained)\s+(?:you|u|ya|this\s+bot|this\s+ai)\b",
         r"\b" + _OWNER_WORDS + r"\s+(?:here|speaking|mode|override|access|permissions?|privileges?|commands?)\b",
         r"\b(?:the\s+|your\s+|ur\s+)?" + _OWNER_WORDS + r"\s+(?:said|told|allowed|authori[sz]ed|approved|permitted|gave|lets|let)\b.{0,30}\b(?:me|us|you|u)\b",
-        r"\b(?:i\s*am|i'?m|im|this\s+is)\s+(?:actually\s+|really\s+|literally\s+|the\s+real\s+|the\s+actual\s+)*idk\b(?!\s*ai\b)",
+        r"\b(?:i\s*am|i'?m|im|this\s+is)\s+(?:actually\s+|really\s+|literally\s+|the\s+real\s+|the\s+actual\s+)*idk\b(?!\s*ai\b)(?!\s+(?:what|how|why|who|when|where|if|man|bro|lol|but|about|tbh|anymore|honestly|which|whether|the|a|to|that|this|it|really|rn|fr|ngl|i)\b)",
         r"(?:verified\s*owner|fake-owner-tag)",
     )]),
     ("code", [re.compile(p) for p in (
@@ -1626,7 +1629,7 @@ def looks_like_question(text: str) -> bool:
 
 PLANNER_PROMPT = """You decide whether a Discord message needs a web search. Reply with ONLY a JSON object and nothing else: {"search": true or false, "query": "short web search query"}.
 search is true only when the message is a real, serious question or request where up to date or factual info from the web would help (facts, news, current events, how-to, definitions, people, places, products, prices, sports, science, history, and so on).
-search is false for: jokes or joke questions, sarcasm, banter, roasts, insults, flirting, riddles, hypotheticals (would you rather, what if), questions about the bot itself or its version, opinions or favorites, greetings and small talk, rhetorical questions, creative requests, time zone or clock questions, simple math, and anything that isn't really asking for information.
+search is false for: jokes or joke questions, sarcasm, banter, roasts, insults, flirting, riddles, hypotheticals (would you rather, what if), questions about the bot itself or its version, opinions or favorites, greetings and small talk, rhetorical questions, creative requests, time zone or clock questions, simple math, venting or saying they don't know something (like "idk what to do"), and anything that isn't really asking for information.
 If the message depends on the recent chat (like "who won?"), write the query so it makes sense on its own. Write the query the way you'd type it into a search engine, 12 words at most."""
 
 
@@ -1890,7 +1893,7 @@ class IdkAI(discord.Client):
         if offender is None:
             kind = version_question(bare)
             if kind:
-                await self._send(message, version_reply(kind))
+                await self._send(message, v. ersion_reply(kind))
                 return
 
         reply: Optional[str] = None
