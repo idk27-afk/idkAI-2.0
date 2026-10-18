@@ -37,6 +37,7 @@ Env vars (see .env.example):
   TAVILY_API_KEY        optional, for web search (TAVILY_API_KEYS, comma separated, also works)
   SEARCH_MODE_DEFAULT   optional, set to "on" to start with search mode already on
   LIVE_DATA / REACTIONS optional, set to "off" to turn live sports+reddit data / emoji reactions off
+  REACTION_EMOJIS       optional, the emojis he may react with (default 😭🥀🥹💔); CUSTOM_REACTIONS=on allows server emojis
   SLANG_FILE            optional, where !slang saves its list (default slang.json)
   CLOWN_TTL_MINUTES     optional, a roasted user is released after this much silence (default 60)
   PORT                  optional, health server port (default 8080)
@@ -56,7 +57,7 @@ import time
 import unicodedata
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Iterable, Optional
 
 import aiohttp
 import discord
@@ -120,13 +121,17 @@ OPENROUTER_URL = "https://openrouter.ai/api/v1"
 GROQ_URL = "https://api.groq.com/openai/v1"
 
 # ---- version + update log (the bot knows these; edit them here when you ship an update) ----
-BOT_VERSION = "2.0.7"
+BOT_VERSION = "2.0.8"
 CHANGELOG: list[tuple[str, list[str]]] = [  # newest first
+    ("2.0.8", [
+        "reactions are way less corny: only a few dramatic emojis by default, and the owner picks which ones he's allowed to use",
+        "the server's custom emojis are off for reactions unless the owner turns them on",
+    ]),
     ("2.0.7", [
         "live sports scores: who's playing, who won, current scores",
         "can look up what people are saying in reddit threads",
         "the owner can tweak his slang on the fly",
-        "reacts to messages with emojis, including the server's own custom ones",
+        "reacts to messages with emojis",
     ]),
     ("2.0.6", [
         "knows that idk just means i dont know (it's not his name), and calls the owner idk or idk (i), or pings him",
@@ -2131,52 +2136,139 @@ class SlangBook:
         return out
 
 
-# ---- reactions: quick emoji acknowledgments, plus emojis he chooses (unicode list or the server's own) ----
+# ---- reactions: a small palette the owner controls ("!react list|add|remove|custom|reset") ----
+REACTIONS_FILE = os.getenv("REACTIONS_FILE", "reactions.json")
 REACT_TAG_RE = re.compile(r"^\s*\[react:\s*([^\]\s]{1,40})\s*\]\s*", re.I)
+REACT_CMD_RE = re.compile(r"^\s*!react\b(?:\s+(?P<action>\w+))?(?:\s+(?P<rest>.+?))?\s*$", re.I | re.S)
+REACT_REPLY_RE = re.compile(r"^React ")
+REACT_USAGE = "React usage: !react list | add <emoji> | remove <emoji> | custom on/off | reset"
+# Default palette: only the dramatic ones. Generic reaction emojis (🤝 🙏 🔥 and friends) read as corny, so they are
+# off until the owner adds them. Set REACTION_EMOJIS in Render to change the default permanently.
+DEFAULT_REACTION_PALETTE = "😭🥀🥹💔"
+
+
+def parse_emojis(s: Optional[str]) -> list[str]:
+    """The emojis from `s` that are on the bot's approved emoji list, in order, no duplicates."""
+    out: list[str] = []
+    for ch in (s or "").replace("\ufe0f", ""):
+        if ch in ALLOWED_EMOJI and ch not in out:
+            out.append(ch)
+    return out
+
+
+class ReactionPrefs:
+    """Which emojis he may react with, and whether he may use the server's own custom emojis (off by default)."""
+
+    MAX = 12
+
+    def __init__(self, path: Optional[str]) -> None:
+        self.path = path
+        self.allowed = parse_emojis(os.getenv("REACTION_EMOJIS", DEFAULT_REACTION_PALETTE)) or parse_emojis(DEFAULT_REACTION_PALETTE)
+        self.custom = os.getenv("CUSTOM_REACTIONS", "").strip().lower() in ("1", "true", "on", "yes")
+        self._defaults = (list(self.allowed), self.custom)
+        self._load()
+
+    def _load(self) -> None:
+        if not self.path or not os.path.exists(self.path):
+            return
+        try:
+            with open(self.path, encoding="utf-8") as f:
+                data = json.load(f)
+            self.allowed = parse_emojis("".join(data.get("allowed") or []))
+            self.custom = bool(data.get("custom"))
+        except (OSError, ValueError, AttributeError, TypeError):
+            log.warning("Couldn't read %s, using the default reactions", self.path)
+
+    def _save(self) -> None:
+        if not self.path:
+            return
+        try:  # best effort: free hosts wipe files on restart or redeploy
+            with open(self.path, "w", encoding="utf-8") as f:
+                json.dump({"allowed": self.allowed, "custom": self.custom}, f)
+        except OSError as e:
+            log.warning("Couldn't save reactions file: %s", e)
+
+    def handle(self, action: Optional[str], rest: Optional[str]) -> str:
+        """Run a !react command and return the reply text."""
+        a = (action or "").lower()
+        if a == "list":
+            return "React list | allowed: " + (" ".join(self.allowed) or "none") + " | custom server emojis: " + ("on" if self.custom else "off")
+        if a in ("add", "allow", "use"):
+            new = parse_emojis(rest)
+            if not new:
+                return "React emoji not allowed. Use a normal one like 😭 🥀 🥹 💔 🔥 🙏 🤝."
+            added = [e for e in new if e not in self.allowed][: max(0, self.MAX - len(self.allowed))]
+            self.allowed += added
+            self._save()
+            return "React added: " + (" ".join(added) if added else "nothing new") + "."
+        if a in ("remove", "rm", "del", "delete", "avoid", "ban"):
+            gone = [e for e in parse_emojis(rest) if e in self.allowed]
+            self.allowed = [e for e in self.allowed if e not in gone]
+            self._save()
+            return ("React removed: " + " ".join(gone) + ".") if gone else "React not in the list."
+        if a == "custom":
+            val = (rest or "").strip().lower()
+            if val not in ("on", "off"):
+                return REACT_USAGE
+            self.custom = val == "on"
+            self._save()
+            return f"React custom server emojis: {val}."
+        if a in ("reset", "clear"):
+            self.allowed, self.custom = list(self._defaults[0]), self._defaults[1]
+            self._save()
+            return "React reset."
+        return REACT_USAGE
+
+
 _QR_END = r"(?:\s+(?:bro|bruh|gng|man|dude|fr|bot|ai|idkai|lol))?[\s!.,]*$"  # only tiny fillers may follow
-QUICK_REACTIONS: list[tuple[re.Pattern, list[str]]] = [
-    (re.compile(r"^(?:thanks|thank you|thank u|thx|ty|tysm)" + _QR_END, re.I), ["🤝", "🙏"]),
+QUICK_REACTIONS: list[tuple[re.Pattern, list[str]]] = [  # (message pattern, emojis that fit; only allowed ones are used)
+    (re.compile(r"^(?:thanks|thank you|thank u|thx|ty|tysm)" + _QR_END, re.I), ["🥹", "🙏", "🤝"]),
     (re.compile(r"^(?:lo+l|lma+o+|lmfao|rofl|ha(?:ha)+h?|he(?:he)+)" + _QR_END, re.I), ["😭"]),
-    (re.compile(r"^(?:ok|okay|k|kk|bet|aight|alr|alright|fair|true|facts|word|cool|nice|gotcha|got it|same|valid)" + _QR_END, re.I), ["🤝", "🗿"]),
-    (re.compile(r"^(?:gn|goodnight|good night|night|nini)" + _QR_END, re.I), ["🙏", "🥀"]),
+    (re.compile(r"^(?:ok|okay|k|kk|bet|aight|alr|alright|fair|true|facts|word|cool|nice|gotcha|got it|same|valid)" + _QR_END, re.I), ["🗿", "🤝"]),
+    (re.compile(r"^(?:gn|goodnight|good night|night|nini)" + _QR_END, re.I), ["🥀", "🙏"]),
     (re.compile(r"^(?:ily|ilu|love u|love you)" + _QR_END, re.I), ["🥹", "🫶"]),
     (re.compile(r"^(?:rip|oof|damn|sad)" + _QR_END, re.I), ["🥀", "💔"]),
-    (re.compile(r"^(?:w bot|good bot|nice one|goated|lets go|let'?s go|lfg|hell yeah|yessir)" + _QR_END, re.I), ["🔥"]),
+    (re.compile(r"^(?:w bot|good bot|nice one|goated|lets go|let'?s go|lfg|hell yeah|yessir)" + _QR_END, re.I), ["🔥", "🥹"]),
 ]
-REACTION_CHOICES = "😭 🥹 🙏 🔥 💔 🥀 🤝 🗿 🫡 💅 😤 🥲"
 
 
-def quick_reaction(text: str) -> Optional[str]:
-    """For tiny acknowledgments ("thanks", "lol", "gn"): an emoji reaction is enough, no text reply."""
+def quick_reaction(text: str, allowed: Iterable[str]) -> Optional[str]:
+    """For tiny acknowledgments ("thanks", "lol", "gn"): one of the allowed emojis instead of a text reply, else None."""
     t = (text or "").strip()
     if not t or len(t.split()) > 5 or "?" in t:
         return None
+    pool = set(allowed)
     for rx, emojis in QUICK_REACTIONS:
         if rx.match(t):
-            return random.choice(emojis)
+            usable = [e for e in emojis if e in pool]
+            return random.choice(usable) if usable else None
     return None
 
 
-def resolve_reaction(name: str, guild: object) -> Optional[object]:
-    """A unicode emoji from the allowed list, or one of this server's own custom emojis by name."""
+def resolve_reaction(name: str, guild: object, prefs: ReactionPrefs) -> Optional[object]:
+    """An allowed unicode emoji, or (only if the owner turned custom ones on) one of this server's emojis by name."""
     n = name.replace("\ufe0f", "").strip(":")
-    if n in ALLOWED_EMOJI:
+    if n in prefs.allowed:
         return n
-    for e in (getattr(guild, "emojis", None) or []):
-        if str(getattr(e, "name", "")).lower() == n.lower() and getattr(e, "available", True):
-            return e
+    if prefs.custom:
+        for e in (getattr(guild, "emojis", None) or []):
+            if str(getattr(e, "name", "")).lower() == n.lower() and getattr(e, "available", True):
+                return e
     return None
 
 
-def reaction_notes(custom_names: list[str]) -> str:
+def reaction_notes(prefs: ReactionPrefs, custom_names: list[str]) -> str:
+    names = custom_names[:15] if prefs.custom else []
+    if not prefs.allowed and not names:
+        return ""
     text = (
         "\n\nREACTIONS (optional): you can also react to the message you're replying to by starting your reply with "
-        "[react:🔥] (the system removes the tag). Use it rarely, about 1 in 5 replies, only when it really fits, like "
-        "something funny, sad, or impressive. Never use it instead of an answer. Emojis you can use: "
-        + REACTION_CHOICES + "."
+        "[react:😭] (the system removes the tag). Use it rarely, about 1 in 5 replies, only when it really fits, like "
+        "something funny, sad, or dramatic. Never use it instead of an answer. Emojis you can react with: "
+        + (" ".join(prefs.allowed) or "none") + "."
     )
-    if custom_names:
-        text += " This server's custom emojis you can use by name, like [react:name]: " + ", ".join(custom_names[:15]) + "."
+    if names:
+        text += " This server's custom emojis you can use by name, like [react:name]: " + ", ".join(names) + "."
     return text
 
 
@@ -2202,6 +2294,7 @@ class IdkAI(discord.Client):
         self.search: Optional[WebSearch] = None
         self.live: Optional[LiveData] = None
         self.slang = SlangBook(SLANG_FILE)
+        self.reactions = ReactionPrefs(REACTIONS_FILE)
         self.reactions_ok = True  # flips to False if Discord says he lacks the Add Reactions permission
         self.reply_count = 0
         self.last_react_at = -10
@@ -2293,6 +2386,20 @@ class IdkAI(discord.Client):
                 log.warning("Couldn't send slang reply: %s", e)
             return
 
+        # ---- owner command: "!react list|add|remove|custom|reset" controls which emojis he reacts with ----
+        react_cmd = REACT_CMD_RE.match(re.sub(rf"<@!?{self.user.id}>", "", message.content or ""))
+        if react_cmd:
+            if uid != OWNER_ID:
+                await self._send(message, random.choice(NOT_OWNER_LINES))
+                return
+            answer = self.reactions.handle(react_cmd.group("action"), react_cmd.group("rest"))
+            log.info("React command: %s", answer)
+            try:
+                await message.reply(answer, mention_author=False)
+            except discord.HTTPException as e:
+                log.warning("Couldn't send react reply: %s", e)
+            return
+
         # ---- attack guard: canned roasts from code, the model never sees these ----
         if decision.kind == "attack":
             off, new_episode = self.guard.hit(uid, decision.category or "bypass", now)
@@ -2326,7 +2433,7 @@ class IdkAI(discord.Client):
 
         # tiny acknowledgments ("thanks", "lol", "gn") get an emoji reaction instead of a text reply
         if offender is None and REACTIONS_ENABLED and self.reactions_ok:
-            quick = quick_reaction(bare)
+            quick = quick_reaction(bare, self.reactions.allowed)
             if quick and await self._add_reaction(message, quick):
                 return
 
@@ -2406,7 +2513,7 @@ class IdkAI(discord.Client):
             react_name and offender is None and not canned and REACTIONS_ENABLED and self.reactions_ok
             and self.reply_count - self.last_react_at >= 3
         ):
-            emoji = resolve_reaction(react_name, getattr(message, "guild", None))
+            emoji = resolve_reaction(react_name, getattr(message, "guild", None), self.reactions)
             if emoji is not None and await self._add_reaction(message, emoji):
                 self.last_react_at = self.reply_count
 
@@ -2438,13 +2545,13 @@ class IdkAI(discord.Client):
             if not text:
                 continue
             if m.author.id == bot_id:
-                if is_canned_line(m.content or "") or is_stock_refusal(m.content or "") or SLANG_REPLY_RE.match(m.content or ""):
+                if is_canned_line(m.content or "") or is_stock_refusal(m.content or "") or SLANG_REPLY_RE.match(m.content or "") or REACT_REPLY_RE.match(m.content or ""):
                     continue  # canned roasts and old robotic refusals would drag his voice off
                 turns.append(("assistant", text))
                 continue
             if not is_trigger:
                 g = guard_text(m, bot_id)
-                if CMD_RE.match(g) or SLANG_CMD_RE.match(g):
+                if CMD_RE.match(g) or SLANG_CMD_RE.match(g) or REACT_CMD_RE.match(g):
                     continue
                 if m.author.id != OWNER_ID and (detect_attack(g) or detect_harass(g)):
                     continue  # weird or attack messages never reach the model, not even from history
@@ -2474,7 +2581,7 @@ class IdkAI(discord.Client):
                 system += live  # live sports / reddit data answers it, no web search needed
             elif self.search_mode and self.search is not None and looks_like_question(trigger_text):
                 system += await self._search_context(trigger_text, merged)
-        system += self.slang.block() + reaction_notes(self._custom_emoji_names(message))
+        system += self.slang.block() + reaction_notes(self.reactions, self._custom_emoji_names(message))
         system += about_block() + VOICE_REMINDER  # last on purpose: the end of the prompt is weighted most
         return [{"role": "system", "content": system}] + merged, recent_emoji_end
 
