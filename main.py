@@ -121,8 +121,11 @@ OPENROUTER_URL = "https://openrouter.ai/api/v1"
 GROQ_URL = "https://api.groq.com/openai/v1"
 
 # ---- version + update log (the bot knows these; edit them here when you ship an update) ----
-BOT_VERSION = "2.0.9"
+BOT_VERSION = "2.0.10"
 CHANGELOG: list[tuple[str, list[str]]] = [  # newest first
+    ("2.0.10", [
+        "reacts to the right message: 'my msg' means the message you sent, 'ur msg' means his, 'the message above' works, and replying to him no longer makes him react to his own message",
+    ]),
     ("2.0.9", [
         "when someone asks him to react with an emoji (like 'react with a x to this') he actually adds the reaction instead of typing it out",
         "works with normal emojis, the server's emojis, and words like x, check or heart, except a few he won't touch",
@@ -2313,6 +2316,9 @@ REACT_FILLER = {
     "with", "w", "wit", "using", "a", "an", "the", "to", "this", "that", "it", "emoji", "emote", "reaction", "reactions",
     "on", "pls", "please", "plz", "thanks", "thx", "and", "too", "also", "now", "message", "msg", "one", "then", "me", "for",
     "bro", "gng", "man", "dude", "fr", "lol", "lmao", "i", "meant", "mean", "above", "here", "ok", "okay", "yo", "hey",
+    # words that say WHICH message
+    "my", "mine", "your", "ur", "ya", "msg", "msgs", "messages", "last", "previous", "prev", "before", "post", "text",
+    "comment", "reply", "response", "replied", "replying", "bot", "bots", "idkai", "idkais", "s",
 }
 # he won't react with these on request: the owner's hard "no 💀" rule plus sexual / offensive ones
 REACT_BLOCKED = set(os.getenv("REACT_BLOCKED", "💀🍆🍑💦🖕🔞").replace("\ufe0f", ""))
@@ -2323,18 +2329,42 @@ REACT_OFF_LINES = ["reactions are turned off rn"]
 CANNED_KEYS.update(_canned_key(s) for s in REACT_REFUSE_LINES + REACT_FAIL_LINES + REACT_UNKNOWN_LINES + REACT_OFF_LINES)
 
 
+# which message should the reaction go on? (checked in this order; no match = the default rule below)
+REACT_TARGET_RES = [
+    ("own", re.compile(r"\b(?:my|mine)\b(?:\s+\w+){0,2}?\s+(?:msgs?|messages?|post|text|comment|reply)\b|\bmine\b", re.I)),
+    ("bot", re.compile(
+        r"\b(?:your|ur|yo|ya)\b(?:\s+\w+){0,2}?\s+(?:msgs?|messages?|reply|response|text|comment)\b|"
+        r"\b(?:bot|idkai)(?:'s|s)?\s+(?:msgs?|messages?|reply|response)\b", re.I)),
+    ("above", re.compile(
+        r"\b(?:above|previous|prev|last)\s+(?:msgs?|messages?)\b|\b(?:msgs?|messages?)\s+(?:above|before)\b|"
+        r"\bthe\s+(?:one|msgs?|messages?)\s+(?:above|before)\b", re.I)),
+    ("replied", re.compile(
+        r"\b(?:the\s+(?:one|msgs?|messages?)\s+(?:i\s+)?(?:replied|replying)(?:\s+to)?|replied(?:\s+(?:msgs?|messages?|one))?|"
+        r"that\s+(?:msgs?|messages?|one)|that)\b", re.I)),
+]
+
+
+def react_target_kind(text: str) -> str:
+    for kind, rx in REACT_TARGET_RES:
+        if rx.search(text or ""):
+            return kind
+    return "default"
+
+
 @dataclass
 class ReactRequest:
     emojis: list  # emoji to add (unicode or "<:name:id>"); empty = "react to this" with no emoji named
     unknown: bool = False  # they named something that isn't an emoji we know
+    target: str = "default"  # "own", "bot", "above", "replied" or "default" (see react_target_kind)
 
 
 def parse_react_request(text: str) -> Optional[ReactRequest]:
-    """None if the message isn't asking him to react; otherwise what to react with."""
+    """None if the message isn't asking him to react; otherwise what to react with, and to which message."""
     m = REACT_REQ_START_RE.match(text or "")
     if not m:
         return None
     rest = text[m.end():]
+    target = react_target_kind(rest)
     # "add a ❌ reaction" / "put a heart on this": the emoji sits inside the matched part, so look from the verb on
     verb = re.search(r"\b(?:add|put|drop)\b", text[m.start():m.end()], re.I)
     scope = text[m.start() + verb.start():] if verb else rest
@@ -2349,12 +2379,13 @@ def parse_react_request(text: str) -> Optional[ReactRequest]:
         if best:
             found = [best[1]]
     if found:
-        return ReactRequest(found[:3])
+        return ReactRequest(found[:3], False, target)
     words = [w for w in re.findall(r"[a-z0-9']+", rest.lower()) if w not in REACT_FILLER]
-    if not rest.strip() or (REACT_FOLLOW_RE.match(rest) and not words):
-        return ReactRequest([])  # "react to this": any reaction will do
-    if REACT_FOLLOW_RE.match(rest):
-        return ReactRequest([], unknown=True)  # "react with a banana"
+    pointing = bool(REACT_FOLLOW_RE.match(rest)) or target != "default"  # "to my msg" etc. is clearly about a reaction
+    if not rest.strip() or (pointing and not words):
+        return ReactRequest([], False, target)  # "react to this": any reaction will do
+    if pointing:
+        return ReactRequest([], True, target)  # "react with a banana"
     return None  # "react or vue?" and the like are just conversation
 
 
@@ -2699,8 +2730,39 @@ class IdkAI(discord.Client):
             if getattr(e, "available", True) and re.fullmatch(r"[A-Za-z0-9_]{2,32}", str(e.name))
         ][:15]
 
+    async def _react_target_message(self, message: discord.Message, kind: str) -> discord.Message:
+        """Which message gets the reaction.
+
+        Replying to HIS message is just how people talk to him, so it does NOT point at that message. Only
+        replying to somebody else's message does. Words like "my msg", "ur msg" or "above" decide it otherwise."""
+        assert self.user is not None
+        replied = getattr(getattr(message, "reference", None), "resolved", None)
+        replied = replied if isinstance(replied, discord.Message) else None
+        try:
+            if kind == "own":
+                return message
+            if kind == "bot":
+                if replied is not None and replied.author.id == self.user.id:
+                    return replied
+                async for m in message.channel.history(limit=15, before=message):
+                    if m.author.id == self.user.id:
+                        return m
+                return message
+            if kind == "above":
+                async for m in message.channel.history(limit=1, before=message):
+                    return m
+                return message
+            if kind == "replied":
+                return replied or message
+        except discord.HTTPException as e:
+            log.warning("Couldn't look up the message to react to: %s", e)
+            return message
+        if replied is not None and replied.author.id != self.user.id:
+            return replied  # they replied to someone else's message and pinged him: that's what they mean
+        return message  # otherwise: their own message
+
     async def _handle_react_request(self, message: discord.Message, req: ReactRequest) -> None:
-        """React for real. "this" means the message they replied to, or their own message if they didn't reply."""
+        """React for real, on the message they mean (see _react_target_message)."""
         if not REACTIONS_ENABLED:
             await self._send(message, random.choice(REACT_OFF_LINES))
             return
@@ -2711,10 +2773,7 @@ class IdkAI(discord.Client):
         if any(is_blocked_reaction(e) for e in emojis):
             await self._send(message, random.choice(REACT_REFUSE_LINES))
             return
-        target = message
-        replied_to = getattr(getattr(message, "reference", None), "resolved", None)
-        if isinstance(replied_to, discord.Message):
-            target = replied_to
+        target = await self._react_target_message(message, req.target)
         try:
             for e in emojis:
                 await target.add_reaction(discord.PartialEmoji.from_str(e) if e.startswith("<") else e)
