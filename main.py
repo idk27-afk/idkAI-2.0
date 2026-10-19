@@ -121,9 +121,9 @@ OPENROUTER_URL = "https://openrouter.ai/api/v1"
 GROQ_URL = "https://api.groq.com/openai/v1"
 
 # ---- version + update log (the bot knows these; edit them here when you ship an update) ----
-BOT_VERSION = "2.0.10"
+BOT_VERSION = "2.1.0"
 CHANGELOG: list[tuple[str, list[str]]] = [  # newest first
-    ("2.0.10", [
+    ("2.1.0", [
         "reacts to the right message: 'my msg' means the message you sent, 'ur msg' means his, 'the message above' works, and replying to him no longer makes him react to his own message",
     ]),
     ("2.0.9", [
