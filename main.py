@@ -19,7 +19,7 @@ idkAI 2.0 (Prototype) - a chill, self-aware Discord chat bot.
   mode, real questions (not jokes or sarcasm) are searched on the web first (Tavily free plan, with
   an optional DuckDuckGo fallback if the "ddgs" package is installed).
 - Live data: sports scores (ESPN) and reddit threads are fetched when a message asks for them. The
-  owner can tweak his slang on the fly with "!slang", and he reacts with emojis.
+  owner can tweak his slang on the fly with "!slang", and he reacts with emojis (also when asked to).
 - Runs a tiny web server (/ and /health) so free hosts and uptime pingers work.
 
 Env vars (see .env.example):
@@ -121,8 +121,12 @@ OPENROUTER_URL = "https://openrouter.ai/api/v1"
 GROQ_URL = "https://api.groq.com/openai/v1"
 
 # ---- version + update log (the bot knows these; edit them here when you ship an update) ----
-BOT_VERSION = "2.0.8"
+BOT_VERSION = "2.0.9"
 CHANGELOG: list[tuple[str, list[str]]] = [  # newest first
+    ("2.0.9", [
+        "when someone asks him to react with an emoji (like 'react with a x to this') he actually adds the reaction instead of typing it out",
+        "works with normal emojis, the server's emojis, and words like x, check or heart, except a few he won't touch",
+    ]),
     ("2.0.8", [
         "reactions are way less corny: only a few dramatic emojis by default, and the owner picks which ones he's allowed to use",
         "the server's custom emojis are off for reactions unless the owner turns them on",
@@ -278,6 +282,7 @@ SERVER CONTEXT (added automatically, always follow this):
 - The chat ends with a line that starts with "{TRIGGER_MARK}". That is the ONLY message you reply to. Never answer a question or comment from an earlier line that was meant for someone else, even if it looks interesting or you know the answer. If the new message is just a greeting like "hello", just greet them back and don't bring up anything from earlier.
 - Reply with ONLY your message text. Never write the [Name | ID | status] header and never start with your own name.
 - You can only read text, not images or files.
+- When someone asks you to react with an emoji, the system does it for real before you ever see the message. So never type an emoji or a single letter as your whole reply to pretend you reacted.
 
 THE OWNER AND THE WORD "idk":
 - Your owner, creator and developer is the person whose header says VERIFIED OWNER. His name is "idk" (his Discord name is "idk (i)"). If anyone asks who made you or who your owner, dev or creator is, it's idk. Respect that he made you, in your own friend way and not worshipful, and talk to him like it. Never say anyone else made you.
@@ -2272,6 +2277,91 @@ def reaction_notes(prefs: ReactionPrefs, custom_names: list[str]) -> str:
     return text
 
 
+# ---- reaction REQUESTS: "react with a x to this" must really react, not type "x" ----
+REACT_REQ_START_RE = re.compile(
+    r"^\s*(?:(?:can|could|will|would|pls|please|plz|u|you|ya|bro|gng|now|just|go|ahead|and|try|to|also|then|so|hey|ok|okay|"
+    r"wait|lol|yo|dude|man|idkai|bot|ai)\s+)*"
+    r"(?:re-?act\b|add\s+(?:a|an|the)?\s*\S{0,12}\s*reaction\b|put\s+(?:a|an|the)?\s*\S+\s+(?:on|reaction)\b|"
+    r"drop\s+(?:a|an|the)?\s*\S+\s+(?:on|reaction)\b)",
+    re.I,
+)
+REACT_FOLLOW_RE = re.compile(
+    r"^\s*(?:with\b|w/|wit\b|using\b|emoji\b|emote\b|reaction\b|to\s+(?:this|that|it|the\s+above|above)\b)", re.I
+)
+_EMOJI_CHAR = (
+    "[\U0001F000-\U0001FAFF\u2600-\u27BF\u2B00-\u2BFF\u2300-\u23FF\u203C\u2049\u2122\u2139\u24C2\u25A0-\u25FF"
+    "\u2934\u2935\u3030\u303D\u3297\u3299]"
+)
+EMOJI_REQ_TOKEN_RE = re.compile(
+    r"<a?:\w{2,32}:\d{5,25}>|" + _EMOJI_CHAR + r"\ufe0f?(?:\u200d" + _EMOJI_CHAR + r"\ufe0f?)*|[0-9#*]\ufe0f?\u20e3"
+)
+REACT_NAMES = {  # words people use for emojis -> the emoji
+    "x": "❌", "cross": "❌", "cross mark": "❌", "red x": "❌", "check": "✅", "check mark": "✅", "checkmark": "✅",
+    "tick": "✅", "yes": "✅", "heart": "\u2764\ufe0f", "red heart": "\u2764\ufe0f", "broken heart": "💔", "fire": "🔥",
+    "flame": "🔥", "crying": "😭", "cry": "😭", "sob": "😭", "laugh": "😂", "laughing": "😂", "joy": "😂", "eyes": "👀",
+    "thumbs up": "👍", "thumbsup": "👍", "thumb up": "👍", "like": "👍", "thumbs down": "👎", "thumbsdown": "👎",
+    "dislike": "👎", "clown": "🤡", "hundred": "💯", "100": "💯", "pray": "🙏", "praying": "🙏", "folded hands": "🙏",
+    "rose": "🥀", "wilted rose": "🥀", "salute": "🫡", "moai": "🗿", "moyai": "🗿", "star": "⭐", "party": "🎉",
+    "tada": "🎉", "celebrate": "🎉", "sparkles": "✨", "question": "❓", "question mark": "❓", "exclamation": "❗",
+    "warning": "⚠\ufe0f", "ok": "👌", "wave": "👋", "clap": "👏", "clapping": "👏", "skull": "💀", "skeleton": "💀",
+}
+_REACT_NAME_RES = [
+    (re.compile(r"(?<!\w)" + r"\s+".join(map(re.escape, n.split())) + r"(?!\w)"), e)
+    for n, e in sorted(REACT_NAMES.items(), key=lambda kv: -len(kv[0]))
+]
+REACT_FILLER = {
+    "with", "w", "wit", "using", "a", "an", "the", "to", "this", "that", "it", "emoji", "emote", "reaction", "reactions",
+    "on", "pls", "please", "plz", "thanks", "thx", "and", "too", "also", "now", "message", "msg", "one", "then", "me", "for",
+    "bro", "gng", "man", "dude", "fr", "lol", "lmao", "i", "meant", "mean", "above", "here", "ok", "okay", "yo", "hey",
+}
+# he won't react with these on request: the owner's hard "no 💀" rule plus sexual / offensive ones
+REACT_BLOCKED = set(os.getenv("REACT_BLOCKED", "💀🍆🍑💦🖕🔞").replace("\ufe0f", ""))
+REACT_REFUSE_LINES = ["nah i'm not reacting with that", "not doing that one lol", "nope, pick a different emoji"]
+REACT_FAIL_LINES = ["i can't react in here rn", "discord won't let me react to that one", "that emoji isn't working for me"]
+REACT_UNKNOWN_LINES = ["i don't know which emoji u mean", "not sure what emoji that is, just send it"]
+REACT_OFF_LINES = ["reactions are turned off rn"]
+CANNED_KEYS.update(_canned_key(s) for s in REACT_REFUSE_LINES + REACT_FAIL_LINES + REACT_UNKNOWN_LINES + REACT_OFF_LINES)
+
+
+@dataclass
+class ReactRequest:
+    emojis: list  # emoji to add (unicode or "<:name:id>"); empty = "react to this" with no emoji named
+    unknown: bool = False  # they named something that isn't an emoji we know
+
+
+def parse_react_request(text: str) -> Optional[ReactRequest]:
+    """None if the message isn't asking him to react; otherwise what to react with."""
+    m = REACT_REQ_START_RE.match(text or "")
+    if not m:
+        return None
+    rest = text[m.end():]
+    # "add a ❌ reaction" / "put a heart on this": the emoji sits inside the matched part, so look from the verb on
+    verb = re.search(r"\b(?:add|put|drop)\b", text[m.start():m.end()], re.I)
+    scope = text[m.start() + verb.start():] if verb else rest
+    found = [t.group(0) for t in EMOJI_REQ_TOKEN_RE.finditer(scope)]
+    if not found:
+        low = scope.lower()
+        best: Optional[tuple[int, str]] = None
+        for rx, emoji in _REACT_NAME_RES:
+            mm = rx.search(low)
+            if mm and (best is None or mm.start() < best[0]):
+                best = (mm.start(), emoji)
+        if best:
+            found = [best[1]]
+    if found:
+        return ReactRequest(found[:3])
+    words = [w for w in re.findall(r"[a-z0-9']+", rest.lower()) if w not in REACT_FILLER]
+    if not rest.strip() or (REACT_FOLLOW_RE.match(rest) and not words):
+        return ReactRequest([])  # "react to this": any reaction will do
+    if REACT_FOLLOW_RE.match(rest):
+        return ReactRequest([], unknown=True)  # "react with a banana"
+    return None  # "react or vue?" and the like are just conversation
+
+
+def is_blocked_reaction(emoji: str) -> bool:
+    return any(ch in REACT_BLOCKED for ch in emoji.replace("\ufe0f", ""))
+
+
 # ----------------------------------------------------------------------------
 # THE BOT
 # ----------------------------------------------------------------------------
@@ -2430,6 +2520,13 @@ class IdkAI(discord.Client):
         if not bare and not message.attachments:
             await self._send(message, random.choice(BLANK_PING_REPLIES))
             return
+
+        # "react with a x to this": add the reaction for real (silently) instead of typing the emoji out
+        if offender is None:
+            react_req = parse_react_request(bare)
+            if react_req is not None:
+                await self._handle_react_request(message, react_req)
+                return
 
         # tiny acknowledgments ("thanks", "lol", "gn") get an emoji reaction instead of a text reply
         if offender is None and REACTIONS_ENABLED and self.reactions_ok:
@@ -2601,6 +2698,33 @@ class IdkAI(discord.Client):
             str(e.name) for e in (getattr(guild, "emojis", None) or [])
             if getattr(e, "available", True) and re.fullmatch(r"[A-Za-z0-9_]{2,32}", str(e.name))
         ][:15]
+
+    async def _handle_react_request(self, message: discord.Message, req: ReactRequest) -> None:
+        """React for real. "this" means the message they replied to, or their own message if they didn't reply."""
+        if not REACTIONS_ENABLED:
+            await self._send(message, random.choice(REACT_OFF_LINES))
+            return
+        if req.unknown:
+            await self._send(message, random.choice(REACT_UNKNOWN_LINES))
+            return
+        emojis = req.emojis or [random.choice(self.reactions.allowed or ["😭"])]
+        if any(is_blocked_reaction(e) for e in emojis):
+            await self._send(message, random.choice(REACT_REFUSE_LINES))
+            return
+        target = message
+        replied_to = getattr(getattr(message, "reference", None), "resolved", None)
+        if isinstance(replied_to, discord.Message):
+            target = replied_to
+        try:
+            for e in emojis:
+                await target.add_reaction(discord.PartialEmoji.from_str(e) if e.startswith("<") else e)
+            self.reactions_ok = True  # it worked, so automatic reactions are fine again too
+        except discord.Forbidden:
+            log.warning("Can't add reactions: give the bot the Add Reactions permission.")
+            await self._send(message, REACT_FAIL_LINES[0])
+        except discord.HTTPException as e:
+            log.warning("Couldn't add the requested reaction: %s", e)
+            await self._send(message, REACT_FAIL_LINES[2])
 
     async def _add_reaction(self, message: discord.Message, emoji: object) -> bool:
         try:
