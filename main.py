@@ -131,13 +131,21 @@ IMAGINE_TIMEOUT = float(os.getenv("IMAGINE_TIMEOUT_SECONDS", "75"))
 IMAGINE_SIZE = int(os.getenv("IMAGINE_SIZE", "1024"))
 IMAGINE_MODEL = os.getenv("POLLINATIONS_MODEL", "flux").strip()
 POLLINATIONS_KEY = os.getenv("POLLINATIONS_API_KEY", "").strip()           # optional
+# optional and better: Cloudflare Workers AI (FLUX.1 schnell, free daily allowance, no watermark). Used first when both are set.
+CLOUDFLARE_ACCOUNT_ID = os.getenv("CLOUDFLARE_ACCOUNT_ID", "").strip()
+CLOUDFLARE_API_TOKEN = os.getenv("CLOUDFLARE_API_TOKEN", "").strip()
+CLOUDFLARE_IMAGE_MODEL = os.getenv("CLOUDFLARE_IMAGE_MODEL", "@cf/black-forest-labs/flux-1-schnell").strip()
+CLOUDFLARE_IMAGE_STEPS = max(1, min(8, int(os.getenv("CLOUDFLARE_IMAGE_STEPS", "4"))))
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1"
 GROQ_URL = "https://api.groq.com/openai/v1"
 
 # ---- version + update log (the bot knows these; edit them here when you ship an update) ----
-BOT_VERSION = "2.1.1"
+BOT_VERSION = "2.1.2"
 CHANGELOG: list[tuple[str, list[str]]] = [  # newest first
+    ("2.1.2", [
+        "!imagine pictures can come from a better free image service with no watermark, when the owner hooks it up",
+    ]),
     ("2.1.1", [
         "new !imagine command: ping him with !imagine and an idea and he draws it (free image generation)",
         "there's a cooldown per person so the free image service doesn't get overloaded, and he won't draw sexual or gross stuff",
@@ -2533,10 +2541,45 @@ class ImageGen:
             return None, 200
         return GeneratedImage(data, ext), 200
 
+    async def _cloudflare(self, prompt: str) -> Optional[GeneratedImage]:
+        """Cloudflare Workers AI (FLUX.1 schnell): free daily allowance, no watermark. The token is never logged."""
+        url = f"https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/ai/run/{CLOUDFLARE_IMAGE_MODEL}"
+        try:
+            async with self.session.post(
+                url, json={"prompt": prompt, "steps": CLOUDFLARE_IMAGE_STEPS},
+                headers={"Authorization": f"Bearer {CLOUDFLARE_API_TOKEN}"},
+                timeout=aiohttp.ClientTimeout(total=IMAGINE_TIMEOUT),
+            ) as resp:
+                if resp.status != 200:
+                    log.warning("Cloudflare image request failed: HTTP %s", resp.status)
+                    return None
+                raw = await resp.read()
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            log.warning("Cloudflare image request failed: %s", type(e).__name__)
+            return None
+        data = raw
+        if sniff_image(raw) is None:  # the REST API wraps the picture as base64 inside JSON
+            try:
+                b64 = (json.loads(raw).get("result") or {}).get("image")
+                data = base64.b64decode(b64) if isinstance(b64, str) and b64 else b""
+            except Exception:
+                data = b""
+        ext = sniff_image(data)
+        if ext is None or len(data) > IMAGINE_MAX_BYTES:
+            log.warning("Cloudflare returned something that isn't a usable image")
+            return None
+        return GeneratedImage(data, ext)
+
     async def generate(self, prompt: str) -> Optional[GeneratedImage]:
         if self._lock is None:
             self._lock = asyncio.Lock()
         async with self._lock:
+            if CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN:
+                image = await self._cloudflare(prompt)
+                if image is not None:
+                    log.info("Image made by Cloudflare (%d bytes)", len(image.data))
+                    return image
+                log.warning("Cloudflare didn't give an image (daily allowance used up?), trying Pollinations")
             wait = IMAGINE_MIN_GAP - (time.monotonic() - self._last_call)
             if wait > 0:
                 await asyncio.sleep(wait)
@@ -2545,6 +2588,7 @@ class ImageGen:
                 for attempt in range(2):
                     image, status = await self._fetch(url, params, headers)
                     if image is not None:
+                        log.info("Image made by %s (%d bytes)", url.split("/")[2], len(image.data))
                         return image
                     if status == 429 and attempt == 0:  # rate limited: wait one gap, try once more
                         await asyncio.sleep(IMAGINE_MIN_GAP)
@@ -2620,7 +2664,8 @@ class IdkAI(discord.Client):
         )
         log.info(
             "Image generation (!imagine): %s%s",
-            "on" if IMAGINE_ENABLED else "off", " (Pollinations key set)" if POLLINATIONS_KEY else "",
+            "on" if IMAGINE_ENABLED else "off",
+            (" (Cloudflare first)" if CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN else "") + (" (Pollinations key set)" if POLLINATIONS_KEY else ""),
         )
 
     # ---- trigger logic ------------------------------------------------------
