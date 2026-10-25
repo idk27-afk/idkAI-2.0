@@ -48,6 +48,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import codecs
+import io
 import json
 import logging
 import os
@@ -58,6 +59,7 @@ import unicodedata
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Iterable, Optional
+from urllib.parse import quote
 
 import aiohttp
 import discord
@@ -117,12 +119,29 @@ OWNER_DISPLAY = os.getenv("OWNER_DISPLAY_NAME", "idk (i)")
 # the bot can ping the owner by writing @idk, but never more often than this
 OWNER_PING_COOLDOWN = float(os.getenv("OWNER_PING_COOLDOWN_SECONDS", "60"))
 
+# ---- image generation: "!imagine <idea>" (Pollinations, free) ----
+IMAGINE_ENABLED = os.getenv("IMAGINE", "on").strip().lower() not in ("0", "off", "false", "no")
+IMAGINE_OWNER_ONLY = os.getenv("IMAGINE_OWNER_ONLY", "").strip().lower() in ("1", "true", "on", "yes")
+IMAGINE_COOLDOWN = float(os.getenv("IMAGINE_COOLDOWN_SECONDS", "45"))   # per person (the owner is exempt)
+IMAGINE_MIN_GAP = float(os.getenv("IMAGINE_MIN_GAP_SECONDS", "16"))     # between any two images (Pollinations throttles anonymous callers)
+IMAGINE_MAX_QUEUE = int(os.getenv("IMAGINE_MAX_QUEUE", "3"))            # how many pictures can be in progress or waiting
+IMAGINE_MAX_PROMPT = 400
+IMAGINE_MAX_BYTES = 8 * 1024 * 1024
+IMAGINE_TIMEOUT = float(os.getenv("IMAGINE_TIMEOUT_SECONDS", "75"))
+IMAGINE_SIZE = int(os.getenv("IMAGINE_SIZE", "1024"))
+IMAGINE_MODEL = os.getenv("POLLINATIONS_MODEL", "flux").strip()
+POLLINATIONS_KEY = os.getenv("POLLINATIONS_API_KEY", "").strip()           # optional
+
 OPENROUTER_URL = "https://openrouter.ai/api/v1"
 GROQ_URL = "https://api.groq.com/openai/v1"
 
 # ---- version + update log (the bot knows these; edit them here when you ship an update) ----
-BOT_VERSION = "2.1.0"
+BOT_VERSION = "2.1.1"
 CHANGELOG: list[tuple[str, list[str]]] = [  # newest first
+    ("2.1.1", [
+        "new !imagine command: ping him with !imagine and an idea and he draws it (free image generation)",
+        "there's a cooldown per person so the free image service doesn't get overloaded, and he won't draw sexual or gross stuff",
+    ]),
     ("2.1.0", [
         "reacts to the right message: 'my msg' means the message you sent, 'ur msg' means his, 'the message above' works, and replying to him no longer makes him react to his own message",
     ]),
@@ -2396,6 +2415,144 @@ def is_blocked_reaction(emoji: str) -> bool:
 # ----------------------------------------------------------------------------
 # THE BOT
 # ----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# v2.1.1: "!imagine <idea>" draws a picture with Pollinations (free).
+# Anyone can use it (set IMAGINE_OWNER_ONLY=on to keep it to the owner).
+# Pollinations throttles anonymous callers (about one request per 15 seconds),
+# so every image goes through one lock with a minimum gap, plus a per-user cooldown.
+# ---------------------------------------------------------------------------
+IMAGINE_CMD_RE = re.compile(r"^\s*!imagine\b(?:\s+(?P<prompt>.+?))?\s*$", re.I | re.S)
+IMAGINE_BLOCK_RE = re.compile(
+    r"\b(?:topless|lingerie|nipples?|bdsm|fetish|hentai|ecchi|undress(?:ed|ing)?|strip(?:per|tease)|genitals?|orgy|"
+    r"incest|rape|raped|molest\w*|gore|gory|beheading|decapitat\w*|dismember\w*|mutilat\w*|torture|suicide|"
+    r"self\s*harm|loli|shota|underage)\b"
+)
+IMAGINE_DONE_LINES = [
+    "here u go", "cooked this up", "say less, here", "ok this one came out kinda crazy",
+    "here, dont say i never did anything for u", "did my best with that one",
+]
+IMAGINE_USAGE_LINES = [
+    "tell me what to draw, like !imagine a cat in a tux", "u gotta say what to draw lol, !imagine then the idea",
+    "draw what tho, try !imagine and then ur idea",
+]
+IMAGINE_LONG_LINES = [f"too long bro, keep it under {IMAGINE_MAX_PROMPT} characters", "thats a whole essay, shorten it"]
+IMAGINE_BLOCKED_LINES = ["nah im not drawing that", "pick something else bro, not drawing that one", "not drawing that, try something normal"]
+IMAGINE_COOLDOWN_LINES = ["one at a time bro, give it a minute", "chill, i just drew one, wait a bit", "my hand needs a break, try again in a bit"]
+IMAGINE_BUSY_LINES = ["too many ppl asking for pics rn, try again in a min", "im backed up on drawings, give it a minute"]
+IMAGINE_FAIL_LINES = ["the image thing isnt working rn, try again in a bit", "couldnt get that one to load, try again", "my drawing hand just broke, try again in a min"]
+IMAGINE_NOPERM_LINES = ["i cant attach pics in here, idk needs to turn on attach files for me"]
+IMAGINE_OFF_LINES = ["image stuff is turned off rn"]
+CANNED_KEYS.update(
+    _canned_key(s)
+    for s in IMAGINE_DONE_LINES + IMAGINE_USAGE_LINES + IMAGINE_LONG_LINES + IMAGINE_BLOCKED_LINES
+    + IMAGINE_COOLDOWN_LINES + IMAGINE_BUSY_LINES + IMAGINE_FAIL_LINES + IMAGINE_NOPERM_LINES + IMAGINE_OFF_LINES
+)
+
+
+def clean_imagine_prompt(text: str) -> str:
+    """Drops mentions and custom emoji, collapses whitespace."""
+    text = re.sub(r"<(?:@[!&]?|#|a?:\w+:)\d+>", " ", text or "")
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def imagine_blocked(prompt: str) -> bool:
+    """True for sexual / gory / self-harm prompts (leetspeak, homoglyphs and spaced tricks are normalized first)."""
+    t = unicodedata.normalize("NFKC", ZERO_WIDTH_RE.sub("", (prompt or "")[:1000]))
+    t = "".join(c for c in unicodedata.normalize("NFKD", t) if not unicodedata.combining(c)).lower()
+    homo = t.translate(HOMOGLYPHS)
+    collapsed = SPACED_RE.sub(lambda m: re.sub(r"[\s._\-*]", "", m.group(0)), homo)  # "n a k e d" -> "naked"
+    variants = list(dict.fromkeys([t, homo, homo.translate(LEET), collapsed, collapsed.translate(LEET)]))
+    if any(detect_harass(v) == "sexual" for v in variants):
+        return True
+    return any(IMAGINE_BLOCK_RE.search(v) for v in variants)
+
+
+def sniff_image(data: bytes) -> Optional[str]:
+    """File extension if the bytes really are an image (an error page must never be posted as a picture)."""
+    if data[:3] == b"\xff\xd8\xff":
+        return "jpg"
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "png"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "webp"
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return "gif"
+    return None
+
+
+@dataclass
+class GeneratedImage:
+    data: bytes
+    ext: str
+
+
+class ImageGen:
+    """Free image generation through Pollinations. One request at a time, with a gap between requests."""
+
+    LEGACY_URL = "https://image.pollinations.ai/prompt/"  # no key needed, throttled when anonymous
+    GEN_URL = "https://gen.pollinations.ai/image/"        # the newer API, wants a key
+
+    def __init__(self, session: aiohttp.ClientSession) -> None:
+        self.session = session
+        self._lock: Optional[asyncio.Lock] = None
+        self._last_call = -1e9
+
+    def endpoints(self, prompt: str) -> list[tuple[str, dict, dict]]:
+        """(url, query params, headers) to try, best first. The key (if any) is never logged."""
+        path = quote(prompt, safe="")
+        params: dict = {
+            "width": IMAGINE_SIZE, "height": IMAGINE_SIZE, "nologo": "true", "safe": "true",
+            "seed": random.randint(1, 999999),
+        }
+        if IMAGINE_MODEL:
+            params["model"] = IMAGINE_MODEL
+        legacy = (self.LEGACY_URL + path, dict(params), {})
+        gen_params, headers = dict(params), {}
+        if POLLINATIONS_KEY:
+            gen_params["key"] = POLLINATIONS_KEY
+            headers["Authorization"] = f"Bearer {POLLINATIONS_KEY}"
+        gen = (self.GEN_URL + path, gen_params, headers)
+        return [gen, legacy] if POLLINATIONS_KEY else [legacy, gen]
+
+    async def _fetch(self, url: str, params: dict, headers: dict) -> tuple[Optional[GeneratedImage], int]:
+        host = url.split("/")[2]
+        try:
+            async with self.session.get(
+                url, params=params, headers=headers, timeout=aiohttp.ClientTimeout(total=IMAGINE_TIMEOUT)
+            ) as resp:
+                if resp.status != 200:
+                    log.warning("Image request to %s failed: HTTP %s", host, resp.status)
+                    return None, resp.status
+                data = await resp.read()
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            log.warning("Image request to %s failed: %s", host, type(e).__name__)
+            return None, 0
+        ext = sniff_image(data)
+        if ext is None or len(data) > IMAGINE_MAX_BYTES:
+            log.warning("Image request to %s returned something that isn't a usable image (%d bytes)", host, len(data))
+            return None, 200
+        return GeneratedImage(data, ext), 200
+
+    async def generate(self, prompt: str) -> Optional[GeneratedImage]:
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        async with self._lock:
+            wait = IMAGINE_MIN_GAP - (time.monotonic() - self._last_call)
+            if wait > 0:
+                await asyncio.sleep(wait)
+            self._last_call = time.monotonic()
+            for url, params, headers in self.endpoints(prompt):
+                for attempt in range(2):
+                    image, status = await self._fetch(url, params, headers)
+                    if image is not None:
+                        return image
+                    if status == 429 and attempt == 0:  # rate limited: wait one gap, try once more
+                        await asyncio.sleep(IMAGINE_MIN_GAP)
+                        continue
+                    break
+            return None
+
+
 class IdkAI(discord.Client):
     def __init__(self) -> None:
         intents = discord.Intents.default()
@@ -2419,6 +2576,9 @@ class IdkAI(discord.Client):
         self.reactions_ok = True  # flips to False if Discord says he lacks the Add Reactions permission
         self.reply_count = 0
         self.last_react_at = -10
+        self.imager: Optional[ImageGen] = None
+        self.last_imagine: dict[int, float] = {}
+        self.imagine_waiting = 0
 
     async def setup_hook(self) -> None:
         self.http_session = aiohttp.ClientSession()
@@ -2430,6 +2590,7 @@ class IdkAI(discord.Client):
         self.ai = AIRouter(providers)
         self.search = WebSearch(self.http_session)
         self.live = LiveData(self.http_session, self.search)
+        self.imager = ImageGen(self.http_session)
         await self._start_health_server()
 
     async def _start_health_server(self) -> None:
@@ -2456,6 +2617,10 @@ class IdkAI(discord.Client):
         log.info(
             "Replying only in channel %s | %d OpenRouter key(s), %d Groq key(s) loaded",
             CHANNEL_ID, len(OPENROUTER_KEYS), len(GROQ_KEYS),
+        )
+        log.info(
+            "Image generation (!imagine): %s%s",
+            "on" if IMAGINE_ENABLED else "off", " (Pollinations key set)" if POLLINATIONS_KEY else "",
         )
 
     # ---- trigger logic ------------------------------------------------------
@@ -2551,6 +2716,13 @@ class IdkAI(discord.Client):
         if not bare and not message.attachments:
             await self._send(message, random.choice(BLANK_PING_REPLIES))
             return
+
+        # "!imagine <idea>": draw a picture (not for someone who is being roasted right now)
+        if offender is None:
+            imagine_cmd = IMAGINE_CMD_RE.match(bare)
+            if imagine_cmd is not None:
+                await self._handle_imagine(message, imagine_cmd.group("prompt") or "")
+                return
 
         # "react with a x to this": add the reaction for real (silently) instead of typing the emoji out
         if offender is None:
@@ -2679,7 +2851,7 @@ class IdkAI(discord.Client):
                 continue
             if not is_trigger:
                 g = guard_text(m, bot_id)
-                if CMD_RE.match(g) or SLANG_CMD_RE.match(g) or REACT_CMD_RE.match(g):
+                if CMD_RE.match(g) or SLANG_CMD_RE.match(g) or REACT_CMD_RE.match(g) or IMAGINE_CMD_RE.match(g):
                     continue
                 if m.author.id != OWNER_ID and (detect_attack(g) or detect_harass(g)):
                     continue  # weird or attack messages never reach the model, not even from history
@@ -2824,6 +2996,65 @@ class IdkAI(discord.Client):
             if self.user is not None and m.author.id == self.user.id and m.content.strip()
         ]
         return any(ends_with_emoji(t) for t in bot_texts[-2:])
+
+    async def _handle_imagine(self, message: discord.Message, raw_prompt: str) -> None:
+        uid = message.author.id
+        if not IMAGINE_ENABLED:
+            await self._send_canned(message, random.choice(IMAGINE_OFF_LINES))
+            return
+        if IMAGINE_OWNER_ONLY and uid != OWNER_ID:
+            await self._send_canned(message, random.choice(NOT_OWNER_LINES))
+            return
+        prompt = clean_imagine_prompt(raw_prompt)
+        if not prompt:
+            await self._send_canned(message, random.choice(IMAGINE_USAGE_LINES))
+            return
+        if len(prompt) > IMAGINE_MAX_PROMPT:
+            await self._send_canned(message, random.choice(IMAGINE_LONG_LINES))
+            return
+        if imagine_blocked(prompt):
+            log.warning("Blocked an image prompt from %s", uid)
+            await self._send_canned(message, random.choice(IMAGINE_BLOCKED_LINES))
+            return
+        now = time.monotonic()
+        if uid != OWNER_ID and now - self.last_imagine.get(uid, -1e9) < IMAGINE_COOLDOWN:
+            await self._send_canned(message, random.choice(IMAGINE_COOLDOWN_LINES))
+            return
+        if self.imagine_waiting >= IMAGINE_MAX_QUEUE:
+            await self._send_canned(message, random.choice(IMAGINE_BUSY_LINES))
+            return
+
+        self.last_imagine[uid] = now  # set first so spamming can't stack up requests
+        self.imagine_waiting += 1
+        image: Optional[GeneratedImage] = None
+        log.info("Image request from %s: %s", uid, prompt[:80])
+        try:
+            async with message.channel.typing():
+                if self.imager is not None:
+                    image = await self.imager.generate(prompt)
+        except Exception:
+            log.exception("Image generation crashed")
+        finally:
+            self.imagine_waiting -= 1
+
+        if image is None:
+            self.last_imagine.pop(uid, None)  # a failed try doesn't use up their turn
+            await self._send_canned(message, random.choice(IMAGINE_FAIL_LINES))
+            return
+        caption = random.choice(IMAGINE_DONE_LINES)
+        caption = self.slang.strip_avoided(caption) or caption
+        try:
+            await message.reply(
+                caption, file=discord.File(io.BytesIO(image.data), filename=f"idkai.{image.ext}"), mention_author=False
+            )
+        except discord.Forbidden:
+            log.warning("Couldn't attach the image: the bot is missing the Attach Files permission")
+            self.last_imagine.pop(uid, None)
+            await self._send_canned(message, random.choice(IMAGINE_NOPERM_LINES))
+        except discord.HTTPException as e:
+            log.warning("Couldn't send the image: %s", e)
+            self.last_imagine.pop(uid, None)
+            await self._send_canned(message, random.choice(IMAGINE_FAIL_LINES))
 
     async def _send_canned(self, message: discord.Message, line: str) -> None:
         """Send a canned line, with the same emoji limits as normal replies."""
